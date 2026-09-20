@@ -28,6 +28,31 @@
 - `key_sem`：二值信号量。**EXTI 中断里只做 `osSemaphoreRelease`**，把消抖、判定、入队这些耗时工作全部甩给 `key` 任务，中断服务时间压到最短。
 - `algo_q`（8 × 1 B）、`ui_q`（16 × 1 B）：事件码 `evt_t` 故意只占 1 字节，和队列 Item Size 严丝合缝，不浪费一个字节的拷贝。
 
+### 任务关系图
+
+```mermaid
+flowchart LR
+    EXTI["EXTI 按键中断<br/>PA4 · 上升沿"]
+    KEY["key 任务 · AboveNormal<br/>事件驱动"]
+    UI["ui 任务 · Normal<br/>200 ms 超时"]
+    ALGO["algo 任务 · High<br/>20 ms"]
+    BLE["ble 任务 · BelowNormal<br/>500 ms"]
+    WDG["wdg 任务 · Low<br/>1000 ms"]
+    AQ["algo_q 8 × 1 B"]
+    IWDG["IWDG 独立看门狗<br/>约 4 s 超时"]
+
+    EXTI -->|"key_sem 二值信号量"| KEY
+    KEY -->|"ui_q 16 × 1 B"| UI
+    AQ -.->|"非阻塞 drain"| ALGO
+    KEY -.->|"g_hb_key++"| WDG
+    ALGO -.->|"g_hb_algo++"| WDG
+    UI -.->|"g_hb_ui++"| WDG
+    BLE -.->|"g_hb_ble++"| WDG
+    WDG -->|"全员健康才喂狗"| IWDG
+```
+
+> 实线是数据通路（信号量 / 队列），虚线是心跳与巡检关系。`algo_q` 目前只保留消费侧。
+
 ## 看门狗 + 多任务心跳监控
 
 表驱动结构 `hb_mon_t g_mon[]` 登记每个受监控任务的**心跳变量地址**和**容忍停滞秒数**：
