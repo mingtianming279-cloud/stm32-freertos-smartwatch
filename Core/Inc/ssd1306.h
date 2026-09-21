@@ -25,5 +25,6 @@ void ssd1306_init(void);
 void ssd1306_fill(uint8_t color);
 /* 开机自检：扫描总线 + 探测 SSD1306，结果写进上面的镜像变量 */
 void ssd1306_selftest(void);
+void ssd1306_bar(uint8_t row, int16_t v);
 
 #endif /* INC_SSD1306_H_ */

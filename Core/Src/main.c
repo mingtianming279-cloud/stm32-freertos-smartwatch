@@ -154,7 +154,7 @@ int main(void)
   if (g_ssd1306_online)
     {
         ssd1306_init();
-        ssd1306_fill(0xFFu);      /* 全白：肉眼确认"通了" */
+        ssd1306_fill(0x00u);      /* 清屏：黑底，下面开始画内容 */
     }
   /* USER CODE END 2 */
 

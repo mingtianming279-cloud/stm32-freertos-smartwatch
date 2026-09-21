@@ -108,3 +108,26 @@ void ssd1306_fill(uint8_t color)
 		                        buf, 129u, 100u);
 	}
 }
+void ssd1306_bar(uint8_t row,int16_t v)
+{
+	uint8_t buf[129];
+	uint8_t page = (uint8_t)(1u + row * 3u);   /* 第 0/1/2 行 → 第
+	  1/4/7 页 */
+
+	buf[0] = 0x40u;
+	for (uint8_t i = 1u; i < 129u; i++) buf[i] = 0x00u;   /*整页先清黑 */
+
+	buf[1u + 64u] = 0x01u;                     /* 中点刻度：1像素高，代表 0 */
+
+	int32_t x = 64 + (int32_t)v * 60 / 16000;  /* 满量程映射到 ±60 列*/
+	if (x < 1)   x = 1;
+	if (x > 126) x = 126;
+	buf[1u + x] = 0xFFu;                       /* 指针：整页 8 像素高*/
+
+	ssd1306_cmd((uint8_t)(0xB0u | page));
+	ssd1306_cmd(0x00u);
+	ssd1306_cmd(0x10u);
+	HAL_I2C_Master_Transmit(&hi2c1, (uint16_t)(SSD1306_I2C_ADDR7 << 1), buf, 129u, 100u);
+
+
+}

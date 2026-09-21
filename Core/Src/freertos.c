@@ -27,6 +27,8 @@
 /* USER CODE BEGIN Includes */
 #include "iwdg.h"
 #include "app_events.h"
+#include "mpu6050.h"
+#include "ssd1306.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -76,8 +78,11 @@ volatile uint32_t g_key_irq = 0; /* ① EXTI 中断次数（含抖动） */
 volatile uint32_t g_key_bounce = 0; /* ② 消抖吃掉的毛刺 / 抖完自己弹回 */
 volatile uint32_t g_key_evt = 0; /* ③ 确认成立并投进 algo_q 的按键 */
 volatile uint32_t g_algo_key = 0; /* ④ algo 处理掉的按键事件 */
+volatile uint8_t  g_mpu_who = 0;   /* 芯片自报身份，期望 0x68 */
+volatile uint32_t g_mpu_err = 0;   /* 非 HAL_OK 的次数，期望 0*/
+volatile uint32_t g_mpu_st  = 0;   /* 最近一次的 HAL */
 
-/* ---- ui 侧 ---- */
+ /* ---- ui 侧 ---- */
 volatile uint32_t g_ui_evt = 0; /* ui 收到的事件数 */
 volatile uint32_t g_ui_refresh = 0; /* ui 真正刷了一下的次数（M3 用 LED 顶替屏幕） */
 volatile uint32_t g_ui_timeout = 0; /* ui 超时醒来的次数（正常） */
@@ -88,7 +93,12 @@ volatile uint32_t g_dead_secs = 0; /* 有过"被判死任务"的秒数 */
 volatile uint32_t g_force_dead = 0; /* 调试钩子：置 1 假装有任务卡死（仅 Debug 构建存在） */
 #endif
 volatile uint32_t g_wdg_degraded = 0; /* 带病喂狗秒数：dead > 0 但因 guard 被豁免的次数 */
-
+volatile int16_t g_ax = 0;
+volatile int16_t g_ay = 0;
+volatile int16_t g_az = 0;
+volatile int16_t g_axf = 0;
+volatile int16_t g_ayf = 0;
+volatile int16_t g_azf = 0;
 hb_mon_t g_mon[] = {
   { .name = "algo", .hb = &g_hb_algo, .limit = 2 },
   { .name = "ui",   .hb = &g_hb_ui,   .limit = 2 },
@@ -115,6 +125,9 @@ volatile uint32_t g_stall_any = 0; /* 本秒有几个任务停滞（0 = 全健�
 
 osSemaphoreId_t key_semHandle;
 const osSemaphoreAttr_t key_sem_attributes = { .name = "key_sem" };
+osMutexId_t i2c_mutexHandle;
+const osMutexAttr_t i2c_mutex_attributes = { .name = "i2c_mutex" };
+
 /* USER CODE END Variables */
 /* Definitions for ble */
 osThreadId_t bleHandle;
@@ -186,7 +199,9 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END Init */
 
   /* USER CODE BEGIN RTOS_MUTEX */
-	/* add mutexes, ... */
+
+	 i2c_mutexHandle = osMutexNew(&i2c_mutex_attributes);
+
   /* USER CODE END RTOS_MUTEX */
 
   /* USER CODE BEGIN RTOS_SEMAPHORES */
@@ -265,10 +280,30 @@ void StartAlgoTask(void *argument)
   /* USER CODE BEGIN StartAlgoTask */
 
 	evt_t rx = EVT_NONE; /* 收回来的 */
+	 uint8_t who = 0;
+	      HAL_StatusTypeDef st = mpu_who_am_i(&who);
+
+	      g_mpu_st = st;
+	      if (st == HAL_OK) { g_mpu_who = who; }
+	      else              { g_mpu_err++;     }
+	      if(g_mpu_st == HAL_OK) g_mpu_st = mpu_wakeup();
 	/* Infinite loop */
 	for (;;) {
 		osDelay(20);
 		g_hb_algo++;
+		int16_t ax,ay,az;
+		osMutexAcquire(i2c_mutexHandle, osWaitForever);
+		HAL_StatusTypeDef r = mpu_read_accel(&ax, &ay, &az);
+		osMutexRelease(i2c_mutexHandle);
+		 if (r == HAL_OK)
+		{
+			g_ax = ax; g_ay = ay; g_az = az;
+			g_axf += (g_ax - g_axf) / 8;
+			g_ayf += (g_ay - g_ayf) / 8;
+			g_azf += (g_az - g_azf) / 8;
+		}else{
+			 g_mpu_err++;
+		}
 
 		while(osMessageQueueGet(algo_qHandle,&rx,NULL,0u) == osOK){
 			g_evt_recv++;
@@ -353,6 +388,13 @@ void StartUiTask(void *argument)
 				break;
 			}
 		}
+		if (osMutexAcquire(i2c_mutexHandle, osWaitForever) == osOK) {
+			ssd1306_bar(0u, g_axf);     /* 第 0 行 → 第 1 页 */
+			ssd1306_bar(1u, g_ayf);     /* 第 1 行 → 第 4 页 */
+			ssd1306_bar(2u, g_azf);     /* 第 2 行 → 第 7 页 */
+			osMutexRelease(i2c_mutexHandle);
+		}
+
 	}
   /* USER CODE END StartUiTask */
 }
