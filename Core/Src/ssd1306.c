@@ -25,13 +25,39 @@ volatile uint32_t g_ssd1306_online = 0;
  *      否则 0x3C 会被当成"发给 0x1E"，永远扫不到东西。
  *   ② 扫描范围避开保留地址：0x00~0x07（广播/保留）与 0x78~0x7F。
  * ------------------------------------------------------------------ */
+/* 单个地址的探测超时（ms）。正常器件几十 µs 就 ACK，2 ms 已有几十倍余量。
+ * 之所以抠得这么死：这是"启动期"代码，每个地址多等 1 ms，112 个地址就多等
+ * 112 ms，而这段时间看门狗正在数秒。 */
+#define I2C_PROBE_TIMEOUT_MS   2u
+
 static uint8_t i2c_scan(uint8_t *out, uint8_t max_n)
 {
 	uint8_t n = 0;
+	uint32_t busy_cnt = 0u;
 
 	for (uint16_t a = 0x08u; a < 0x78u; a++)
 	{
-		if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(a << 1), 2u, 10u) == HAL_OK)
+		HAL_StatusTypeDef st = HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(a << 1),
+		                                             1u, I2C_PROBE_TIMEOUT_MS);
+		if (st == HAL_BUSY)
+		{
+			/* BUSY 又锁死了：先恢复总线，再把这个地址重问一次。
+			 * 这里千万不能直接 break —— 那样 g_i2c_found 会变成"一个都没扫到"
+			 * 的假 0，把"总线卡死"误报成"总线上没有器件"（我就被这个坑过一次）。 */
+			if (i2c1_recover_bus() == 0u)
+			{
+				break;              /* 真救不回来，别再耗了 */
+			}
+			if (++busy_cnt > 4u)
+			{
+				/* 每个地址都锁一次的话，112 × (25 ms + 恢复) 要 3 秒，
+				 * 白白把启动拖长。救几次还不行就认输。 */
+				break;
+			}
+			st = HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(a << 1),
+			                           1u, I2C_PROBE_TIMEOUT_MS);
+		}
+		if (st == HAL_OK)
 		{
 			if (n < max_n) out[n] = (uint8_t)a;
 			n++;
@@ -44,11 +70,20 @@ void ssd1306_selftest(void)
 {
 	uint8_t found[8];
 
+	/* 体检之前先把总线救活：MX_I2C1_Init() 里已经试过一次，但那是复位后
+	 * 几毫秒，从机可能还没上电稳。到这一刻（启动约几十毫秒）再试一次非常便宜
+	 * —— BUSY 没置位就直接返回。不救的话下面 112 个地址会逐个白等 25 ms。 */
+	i2c1_recover_bus();
+
 	g_i2c_found = i2c_scan(found, 8u);
 	if (g_i2c_found > 0u) g_i2c_addr1 = found[0];
 	if (g_i2c_found > 1u) g_i2c_addr2 = found[1];
 
 	/* SSD1306 单点探测：发地址帧，等 ACK */
+	/* 这次故意用又宽又多次的探测（20 ms × 2 次），不走上面那个 2 ms：
+	 * 它的结果 g_ssd1306_online 是一次性的、会被锁存下来，直接决定
+	 * main() 到底调不调 ssd1306_init()。误判成"不在线"的代价是屏永远黑，
+	 * 而多花的这几十毫秒在启动期完全不值一提。 */
 	g_ssd1306_online = (HAL_I2C_IsDeviceReady(&hi2c1,
 	                        (uint16_t)(SSD1306_I2C_ADDR7 << 1), 2u, 20u) == HAL_OK) ? 1u : 0u;
 }

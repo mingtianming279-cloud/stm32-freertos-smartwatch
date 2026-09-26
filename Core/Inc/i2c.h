@@ -42,6 +42,11 @@ void MX_I2C1_Init(void);
 
 /* USER CODE BEGIN Prototypes */
 
+/* I2C1 总线恢复：清掉 F1 的 SR2.BUSY 假置位 / 把被从机按住的线顶出来。
+ * 返回 1 = 恢复后总线可用；0 = 仍然 BUSY（真救不回来）。
+ * BUSY 未置位时零开销直接返回 1，运行时可以放心反复调用。 */
+uint32_t i2c1_recover_bus(void);
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

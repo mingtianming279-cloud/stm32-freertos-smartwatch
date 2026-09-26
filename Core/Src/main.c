@@ -56,6 +56,10 @@ volatile uint32_t g_boot_loop_cnt   = 0;   /* 连续"没活够"的次数 */
 volatile uint32_t g_boot_loop_guard = 0;   /* 1 = 判定疑似 boot loop（本步只观测） */
 volatile uint32_t g_alive_sec          = 0;   /* 本次启动已经活了多少秒 */
 volatile uint32_t g_boot_loop_healthy  = 0;   /* 1 = 已经上报"活够了" */
+/* ↓↓↓ 诊断用：给"调度器启动前"这段打表（看门狗已在计时，这段必须短）↓↓↓ */
+volatile uint32_t g_scan_ms  = 0;   /* 总线体检(i2c_scan + OLED 探测) 耗时 ms */
+volatile uint32_t g_init_ms  = 0;   /* OLED 初始化 + 清屏 耗时 ms */
+volatile uint32_t g_boot_ms  = 0;   /* main 从复位到"进调度器前"的总耗时 ms */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -101,7 +105,10 @@ int main(void)
   MX_GPIO_Init();
   MX_I2C1_Init();
   MX_USART1_UART_Init();
-  MX_IWDG_Init();
+  /* MX_IWDG_Init(); ← 故意不在这里调用：看门狗一通电就开始数秒、中途没法暂停，
+     而下面的启动体检最坏要跑好几秒，"开早了"的结果就是上电即复位的无限重启。
+     已挪到本函数末尾 USER CODE BEGIN 2 里，见那里的说明。
+     ⚠ 用 CubeMX 重新生成代码会把这一行加回来，届时记得再删掉一次。 */
   /* USER CODE BEGIN 2 */
   /* ---- 备份域：跨复位保留的自留地 ------------------------------------
    * ① 三个前提缺一不可，少一个就是"静默失败"（写不进去还不报错）
@@ -151,11 +158,29 @@ int main(void)
    * g_ssd1306_online）。放在调度器启动前是白送的 —— 此刻没有任务，
    * 扫描最坏阻塞约 1 秒也不影响任何心跳。*/
   ssd1306_selftest();
+  g_scan_ms = HAL_GetTick();           /* 诊断：进调度器前已耗时（体检含在内） */
+
   if (g_ssd1306_online)
     {
+        uint32_t t_init = HAL_GetTick();
         ssd1306_init();
         ssd1306_fill(0x00u);      /* 清屏：黑底，下面开始画内容 */
+        g_init_ms = HAL_GetTick() - t_init;   /* 诊断：OLED 初始化耗时 */
     }
+
+  g_boot_ms = HAL_GetTick();           /* 诊断：main 到"进调度器前"的总耗时 */
+
+  /* ---- 看门狗：等"系统准备好被监督"这一刻才武装 -------------------------
+   * ① HAL_IWDG_Init() 一执行，IWDG 立刻开始倒数，装完就算、中途无法暂停；
+   * ② 第一次喂狗要等 wdg 任务跑完 osDelay(1000)，所以留给
+   *    "复位 → 调度器起来 + 1 s"的预算只有约 3 秒（IWDG 超时约 4 s）；
+   * ③ 上面的启动体检最坏能吃掉好几秒（I2C 卡死时每个地址要白等 25 ms 的
+   *    固定 BUSY 超时，112 个地址就是 2.8 s），一超就是"上电即复位"；
+   * ④ 而且那次复位发生在调度器启动之前，wdg 任务永远跑不到，
+   *    g_boot_loop_guard 那套 boot loop 防护也救不回来 —— 直接死循环。
+   * 所以：启动逻辑全部跑完，再打开看门狗。
+   * -------------------------------------------------------------------- */
+  MX_IWDG_Init();
   /* USER CODE END 2 */
 
   /* Init scheduler */
@@ -165,7 +190,6 @@ int main(void)
   /* Start scheduler */
   osKernelStart();
 
-  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */

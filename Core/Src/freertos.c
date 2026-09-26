@@ -84,7 +84,7 @@ volatile uint32_t g_mpu_st  = 0;   /* 最近一次的 HAL */
 
  /* ---- ui 侧 ---- */
 volatile uint32_t g_ui_evt = 0; /* ui 收到的事件数 */
-volatile uint32_t g_ui_refresh = 0; /* ui 真正刷了一下的次数（M3 用 LED 顶替屏幕） */
+volatile uint32_t g_ui_refresh = 0; /* 预留：ui 真正画完一屏的次数（目前还没有人给它赋值） */
 volatile uint32_t g_ui_timeout = 0; /* ui 超时醒来的次数（正常） */
 volatile uint32_t g_ui_put = 0; /* key 成功投进 ui_q 的次数 */
 volatile uint32_t g_ui_putfail = 0; /* ui_q 满、投失败的次数   */
