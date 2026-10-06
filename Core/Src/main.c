@@ -23,10 +23,12 @@
 #include "iwdg.h"
 #include "usart.h"
 #include "gpio.h"
+#include "spi.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "ssd1306.h"
+#include "lcd.h"
+#include "rtc_time.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -57,8 +59,8 @@ volatile uint32_t g_boot_loop_guard = 0;   /* 1 = 判定疑似 boot loop（本�
 volatile uint32_t g_alive_sec          = 0;   /* 本次启动已经活了多少秒 */
 volatile uint32_t g_boot_loop_healthy  = 0;   /* 1 = 已经上报"活够了" */
 /* ↓↓↓ 诊断用：给"调度器启动前"这段打表（看门狗已在计时，这段必须短）↓↓↓ */
-volatile uint32_t g_scan_ms  = 0;   /* 总线体检(i2c_scan + OLED 探测) 耗时 ms */
-volatile uint32_t g_init_ms  = 0;   /* OLED 初始化 + 清屏 耗时 ms */
+volatile uint32_t g_scan_ms  = 0;   /* 总线体检(i2c_selftest) 耗时 ms */
+volatile uint32_t g_init_ms  = 0;   /* 显示初始化(lcd_init) 耗时 ms */
 volatile uint32_t g_boot_ms  = 0;   /* main 从复位到"进调度器前"的总耗时 ms */
 /* USER CODE END PV */
 
@@ -88,7 +90,7 @@ int main(void)
   /* MCU Configuration--------------------------------------------------------*/
 
   /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
+   HAL_Init();
 
   /* USER CODE BEGIN Init */
 
@@ -103,6 +105,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_SPI1_Init();
   MX_I2C1_Init();
   MX_USART1_UART_Init();
   /* MX_IWDG_Init(); ← 故意不在这里调用：看门狗一通电就开始数秒、中途没法暂停，
@@ -118,6 +121,16 @@ int main(void)
   __HAL_RCC_PWR_CLK_ENABLE();          /* 前提 1：PWR 时钟 */
   __HAL_RCC_BKP_CLK_ENABLE();          /* 前提 2：BKP 时钟 */
   HAL_PWR_EnableBkUpAccess();          /* 前提 3：解除备份域写保护（DBP 位） */
+
+  /* ---- 时间子系统：★ 必须放在所有 BKP 读写之前 -------------------------
+   * 原因：rtc_time_init() 在"备份域已经丢了、需要重新配置 RTC"时会执行
+   * BDRST（备份域复位），而 BKP->DR1~DR10 就住在那个域里 —— 放后面会把
+   * 复位计数、死亡档案、boot loop 计数统统抹掉。
+   * 反过来放这里就没事：它只在真断电（那些数据本来也已经丢了）或者 RTC
+   * 时钟源发生变化时才复位；软复位（看门狗复位是常态）时备份域还活着、
+   * RTC 也还在走，它什么都不动。
+   * ------------------------------------------------------------------ */
+  rtc_time_init();
 
   if (BKP->DR10 != BKP_MAGIC)          /* 没读到签名 → 这份数据不可信 */
   {
@@ -155,18 +168,10 @@ int main(void)
   g_boot_loop_guard = (g_boot_loop_cnt >= BOOT_LOOP_MAX) ? 1u : 0u;
 
   /* 开机体检：I2C 总线上都有谁（结果看 g_i2c_found / g_i2c_addr1 /
-   * g_ssd1306_online）。放在调度器启动前是白送的 —— 此刻没有任务，
-   * 扫描最坏阻塞约 1 秒也不影响任何心跳。*/
-  ssd1306_selftest();
+   * g_i2c_addr2，本项目预期扫到 0x68 = MPU6050）。放在调度器启动前是白送的
+   * —— 此刻没有任务，扫描最坏阻塞约 1 秒也不影响任何心跳。*/
+  i2c_selftest();
   g_scan_ms = HAL_GetTick();           /* 诊断：进调度器前已耗时（体检含在内） */
-
-  if (g_ssd1306_online)
-    {
-        uint32_t t_init = HAL_GetTick();
-        ssd1306_init();
-        ssd1306_fill(0x00u);      /* 清屏：黑底，下面开始画内容 */
-        g_init_ms = HAL_GetTick() - t_init;   /* 诊断：OLED 初始化耗时 */
-    }
 
   g_boot_ms = HAL_GetTick();           /* 诊断：main 到"进调度器前"的总耗时 */
 
@@ -180,6 +185,33 @@ int main(void)
    *    g_boot_loop_guard 那套 boot loop 防护也救不回来 —— 直接死循环。
    * 所以：启动逻辑全部跑完，再打开看门狗。
    * -------------------------------------------------------------------- */
+  /* ---- 屏幕上电自检：黑 → 白 → 红 → 绿 → 蓝，各 0.25 秒 ----------------
+   * 留着这段不是为了好看，它是个"不用调试器就能判断屏还活着"的探针：
+   * 显示链路任何一环断了（背光、接触不良、SPI、初始化序列），上电一眼可见。
+   * 而这套东西的 8 根杜邦线确实接触不良过一次，代价是查了小半天。
+   *
+   * 顺序也不是随便排的，"黑"放第一个是判读需要：
+   *   ST7789 上电未经初始化时屏本身就是白的（GRAM 内容不定 + IPS 面板）；
+   *   初始化完了但一个像素都没写进去、GRAM 全 0x0000 再被 INVON 反显，
+   *   同样也是白的 —— 所以"看到白色"区分不了这两种情况，什么也证明不了。
+   *   只有真的刷黑了，才说明 命令 → 窗口 → 像素 这条通路是通的。
+   *
+   * 放在 MX_IWDG_Init() 之前：这段阻塞正好落在"看门狗还没武装"的窗口里。
+   * 别让看门狗和长阻塞共存于同一时间窗（09-26 的教训）。
+   *
+   * 发送次数 = 9(lcd_init) + 5 × 245(每次刷屏) = 1234，对照 g_spi_tx_ok 用。
+   * -------------------------------------------------------------------- */
+  uint32_t t_lcd = HAL_GetTick();
+  lcd_init();
+  g_init_ms = HAL_GetTick() - t_lcd;   /* 诊断：显示初始化耗时（含约 380 ms 的各种等待） */
+
+  lcd_clear(LCD_BLACK); HAL_Delay(250);
+  lcd_clear(LCD_WHITE); HAL_Delay(250);
+  lcd_clear(LCD_RED);   HAL_Delay(250);
+  lcd_clear(LCD_GREEN); HAL_Delay(250);
+  lcd_clear(LCD_BLUE);  HAL_Delay(250);
+  lcd_clear(LCD_BLACK);                /* 收在黑底：接下来 ui 任务直接在它上面画 */
+
   MX_IWDG_Init();
   /* USER CODE END 2 */
 

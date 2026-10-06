@@ -179,22 +179,12 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
     PB8     ------> I2C1_SCL
     PB9     ------> I2C1_SDA
     */
-    /* ★ I2C1 走重映射脚 PB8/PB9 —— 必须先打开 AFIO 重映射！
-     *   不开的话 PB8/PB9 只是两个普通 GPIO，I2C1 仍然留在 PB6/PB7 上，
-     *   等于完全没接通（这就是"接了线却一个器件都扫不到"的成因之一）。 */
-    __HAL_AFIO_REMAP_I2C1_ENABLE();
-
-    GPIO_InitStruct.Pin = I2C1_SCL_PIN|I2C1_SDA_PIN;
+    GPIO_InitStruct.Pin = GPIO_PIN_8|GPIO_PIN_9;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-#if I2C_USE_INTERNAL_PULLUP
-    /* 救命档：拿 MCU 内部上拉顶替模块那一侧的上拉电阻 */
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-#else
-    /* 正常配置：I2C 是开漏总线，上拉电阻长在模块那一侧，芯片内部不该给 */
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-#endif
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    __HAL_AFIO_REMAP_I2C1_ENABLE();
 
     /* I2C1 clock enable */
     __HAL_RCC_I2C1_CLK_ENABLE();
@@ -216,12 +206,12 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* i2cHandle)
     __HAL_RCC_I2C1_CLK_DISABLE();
 
     /**I2C1 GPIO Configuration
-    PB6     ------> I2C1_SCL
-    PB7     ------> I2C1_SDA
+    PB8     ------> I2C1_SCL
+    PB9     ------> I2C1_SDA
     */
-    HAL_GPIO_DeInit(GPIOB, I2C1_SCL_PIN);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_8);
 
-    HAL_GPIO_DeInit(GPIOB, I2C1_SDA_PIN);
+    HAL_GPIO_DeInit(GPIOB, GPIO_PIN_9);
 
   /* USER CODE BEGIN I2C1_MspDeInit 1 */
 
@@ -383,6 +373,77 @@ uint32_t i2c1_recover_bus(void)
 
 	g_i2c_rec_step = 8u;
 	return 0u;
+}
+
+/* ── 总线体检 ─────────────────────────────────────────────────────────
+ * 扫 0x08~0x77，把应答的地址记下来。这是"上电后总线上都有谁"的第一手证据，
+ * 也是启动期唯一一次全总线扫描 —— 之后各个任务只管自己那个从机，不再扫。
+ *
+ * 两个坑：
+ *   ① HAL 的地址参数是 8 位格式（bit0 = 读写位）→ 7 位地址必须 << 1，
+ *      否则 0x3C 会被当成"发给 0x1E"，永远扫不到东西。
+ *   ② 扫描范围避开保留地址：0x00~0x07（广播/保留）与 0x78~0x7F。
+ *
+ * 这段代码原来住在 ssd1306.c 里，和 OLED 驱动捆在一起。OLED 退役后搬到这儿
+ * —— 它本来就跟"怎么显示"没关系，是 I2C 总线自己的事。
+ * ──────────────────────────────────────────────────────────────────── */
+volatile uint32_t g_i2c_found = 0;   /* 总线上应答的器件个数 */
+volatile uint32_t g_i2c_addr1 = 0;   /* 第一个应答的 7 位地址 */
+volatile uint32_t g_i2c_addr2 = 0;   /* 第二个；本项目预期是 0x68（MPU6050） */
+
+/* 单个地址的探测超时（ms）。正常器件几十 µs 就 ACK，2 ms 已有几十倍余量。
+ * 之所以抠得这么死：这是"启动期"代码，每个地址多等 1 ms，112 个地址就多等
+ * 112 ms，而这段时间看门狗正在数秒。 */
+#define I2C_PROBE_TIMEOUT_MS   2u
+
+static uint8_t i2c_scan(uint8_t *out, uint8_t max_n)
+{
+	uint8_t n = 0;
+	uint32_t busy_cnt = 0u;
+
+	for (uint16_t a = 0x08u; a < 0x78u; a++)
+	{
+		HAL_StatusTypeDef st = HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(a << 1),
+		                                             1u, I2C_PROBE_TIMEOUT_MS);
+		if (st == HAL_BUSY)
+		{
+			/* BUSY 又锁死了：先恢复总线，再把这个地址重问一次。
+			 * 这里千万不能直接 break —— 那样 g_i2c_found 会变成"一个都没扫到"
+			 * 的假 0，把"总线卡死"误报成"总线上没有器件"。 */
+			if (i2c1_recover_bus() == 0u)
+			{
+				break;              /* 真救不回来，别再耗了 */
+			}
+			if (++busy_cnt > 4u)
+			{
+				/* 每个地址都锁一次的话，112 × (25 ms + 恢复) 要 3 秒，
+				 * 白白把启动拖长。救几次还不行就认输。 */
+				break;
+			}
+			st = HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(a << 1),
+			                           1u, I2C_PROBE_TIMEOUT_MS);
+		}
+		if (st == HAL_OK)
+		{
+			if (n < max_n) out[n] = (uint8_t)a;
+			n++;
+		}
+	}
+	return n;
+}
+
+void i2c_selftest(void)
+{
+	uint8_t found[8];
+
+	/* 体检之前先把总线救活：MX_I2C1_Init() 里已经试过一次，但那是复位后
+	 * 几毫秒，从机可能还没上电稳。到这一刻（启动约几十毫秒）再试一次非常便宜
+	 * —— BUSY 没置位就直接返回。不救的话下面 112 个地址会逐个白等 25 ms。 */
+	i2c1_recover_bus();
+
+	g_i2c_found = i2c_scan(found, 8u);
+	if (g_i2c_found > 0u) g_i2c_addr1 = found[0];
+	if (g_i2c_found > 1u) g_i2c_addr2 = found[1];
 }
 
 /* USER CODE END 1 */

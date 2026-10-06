@@ -47,6 +47,15 @@ void MX_I2C1_Init(void);
  * BUSY 未置位时零开销直接返回 1，运行时可以放心反复调用。 */
 uint32_t i2c1_recover_bus(void);
 
+/* ── 总线体检 ──────────────────────────────────────────────────────────
+ * 扫一遍 0x08~0x77，结果写进下面三个镜像变量。
+ * 在调度器启动前调用最划算 —— 那时还没有任务，最坏阻塞 1 秒也不影响任何心跳。 */
+void i2c_selftest(void);
+
+extern volatile uint32_t g_i2c_found;   /* 总线上应答的器件个数 */
+extern volatile uint32_t g_i2c_addr1;   /* 第一个应答的 7 位地址 */
+extern volatile uint32_t g_i2c_addr2;   /* 第二个应答的 7 位地址 */
+
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus
