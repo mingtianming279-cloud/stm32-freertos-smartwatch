@@ -63,6 +63,20 @@ void lcd_draw_str(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t b
 /* 一个字符串画出来有多宽（像素），用于居中排版 */
 uint16_t lcd_str_width(const char *s, uint8_t scale);
 
+/* ---- 汉字（16x16 按需子集，字表见 hz16.h）-----------------------------
+ * 每个汉字占一个 16x16 的格子，scale 同样是整数倍放大。
+ *
+ * 字符串里**可以混 ASCII**：ASCII 会被居中放进 16 宽的格子，不会全挤在
+ * 左边跟汉字对不齐。所以 "步数 123" 这种混排可以直接画。
+ *
+ * ⚠ 字库里没有的字会画成一个"空格子"（填背景色）而不是留下上一帧的残影 ——
+ *   本屏没有 framebuffer，留白会让人以为排版错了，空位至少能看出这里有个字
+ *   但没数据，加字只需改 tools/gen_hz.py 里的 HANZI 再跑一遍。
+ * -------------------------------------------------------------------- */
+void     lcd_draw_hz(uint16_t x, uint16_t y, const char *utf8, uint16_t fg, uint16_t bg, uint8_t scale);
+void     lcd_draw_hz_str(uint16_t x, uint16_t y, const char *s, uint16_t fg, uint16_t bg, uint8_t scale);
+uint16_t lcd_hz_str_width(const char *s, uint8_t scale);
+
 /* ---- 数字转字符串 ----------------------------------------------------
  * 故意不用 sprintf：带 %d 会让链接器把 newlib 的格式化部分拉进来，
  * 在 F103 上要多掏好几 KB Flash，而我们只要转个整数。

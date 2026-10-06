@@ -86,7 +86,10 @@ typedef struct {
 #define UI_STEP_NUM_H  48u      /* = 16 × UI_STEP_SCALE */
 #define UI_STEP_SCALE   3u      /* 3 倍放大 → 24x48 一个字符，5 位数正好 120 px 宽 */
 #define UI_STEP_DBG_Y  124u     /* 调试量起始行 */
-#define UI_STEP_LINES   5u
+#define UI_STEP_LINES   4u      /* 给底部的二次确认提示腾出一行 */
+
+/* 二次确认提示那一行的位置 */
+#define UI_HINT_Y      (UI_STEP_DBG_Y + 4u * UI_INFO_STEP)
 
 /* ui_kv_line 的差分记账是 INFO / STEP 两页共用一个数组，用下标区间分开 */
 #define UI_KV_LINES    (UI_INFO_LINES + UI_STEP_LINES)
@@ -207,7 +210,11 @@ hb_mon_t g_mon[] = {
  } menu_id_t;
 
  static const uint8_t s_menu_pages[MENU_MAX] = { PAGE_STEP, PAGE_ACCEL, PAGE_INFO };
- static const char *const s_menu_names[MENU_MAX] = { "STEPS", "ACCEL", "INFO" };
+ static const char *const s_menu_names[MENU_MAX] = { "步数", "三轴", "系统" };
+
+ /* 二次确认的窗口：第一次按只提示，这段时间内再按才真的执行。
+  * 之所以要做：步数清零是不可逆的，按一下就丢数据太危险。 */
+ #define UI_CONFIRM_MS   3000u
 
 volatile uint32_t g_ui_page    = 0;  /* 当前页面编号（镜像，供观测） */
 volatile uint32_t g_ui_page_sw = 0;  /* 累计切换次数 */
@@ -285,7 +292,9 @@ static void death_log_save(void);   /* 停喂前把"死因"写进备份寄存器
 static void ui_invalidate(void);
 static void ui_render(void);
 static void ui_handle_key(evt_t ev);
+static void ui_confirm_tick(void);
 static void ui_bar_update(uint8_t idx, uint16_t y, char label, int16_t v);
+static void ui_confirm_hint(void);
 static void ui_kv_line(uint8_t idx, uint16_t y, const char *label, uint32_t value);
 static void ui_step_page(void);
 static void ui_info_page(void);
@@ -556,6 +565,9 @@ void StartUiTask(void *argument)
 			}
 		}
 
+		/* 二次确认超时自动取消 */
+		ui_confirm_tick();
+
 		/* 屏幕走 SPI，不再碰 I2C，所以不需要 i2c_mutex 了。
 		 * 注意：以后如果有第二个任务也要画屏，得给 SPI 配一把锁 ——
 		 * 现在只有 ui 一个任务在写屏，所以先不加。 */
@@ -676,6 +688,8 @@ static uint32_t s_info_prev[UI_KV_LINES];     /* 键值行的上一次值（INFO
 static uint32_t s_step_shown = 0xFFFFFFFFu;   /* 上次显示的步数；初值取一个不可能的值以强制首帧重画 */
 static uint32_t s_rtc_shown  = 0xFFFFFFFFu;   /* 上次显示的 RTC 时钟源 */
 static uint32_t s_menu_sel_shown = 0xFFFFFFFFu; /* 菜单上次高亮的是第几项 */
+static uint8_t  s_confirm_pending = 0u;         /* 1 = 正在等"再按一次" */
+static uint32_t s_confirm_deadline = 0u;        /* 二次确认超时时刻（HAL_GetTick） */
 static uint8_t s_page_valid = 0u;             /* 0 = 当前页的静态部分还没画 */
 
 static void ui_invalidate(void)
@@ -688,6 +702,7 @@ static void ui_invalidate(void)
 	s_step_shown = 0xFFFFFFFFu;
 	s_rtc_shown  = 0xFFFFFFFFu;
 	s_menu_sel_shown = 0xFFFFFFFFu;
+	s_confirm_pending = 0u;
 }
 
 static void ui_bar_update(uint8_t idx, uint16_t y, char label, int16_t v)
@@ -821,10 +836,13 @@ static void ui_step_page(void)
 	/* 下面三个是调阀值用的：正常走一段路，盯 PEAK —— 阈值要明显低于它，
 	 * 又明显高于静止时的噪声底。REJ 在快速上涨说明阈值偏低。 */
 	ui_kv_line((uint8_t)(UI_KV_STEP + 0u), (uint16_t)(UI_STEP_DBG_Y + 0u * UI_INFO_STEP), "DYN",   (uint32_t)d);
-	ui_kv_line((uint8_t)(UI_KV_STEP + 1u), (uint16_t)(UI_STEP_DBG_Y + 1u * UI_INFO_STEP), "DC",    (uint32_t)((g_step_dc < 0) ? -g_step_dc : g_step_dc));
-	ui_kv_line((uint8_t)(UI_KV_STEP + 2u), (uint16_t)(UI_STEP_DBG_Y + 2u * UI_INFO_STEP), "PEAK",  (uint32_t)g_step_dyn_peak);
-	ui_kv_line((uint8_t)(UI_KV_STEP + 3u), (uint16_t)(UI_STEP_DBG_Y + 3u * UI_INFO_STEP), "REJ",   g_step_reject);
-	ui_kv_line((uint8_t)(UI_KV_STEP + 4u), (uint16_t)(UI_STEP_DBG_Y + 4u * UI_INFO_STEP), "SHOCK", g_step_shock);
+	ui_kv_line((uint8_t)(UI_KV_STEP + 1u), (uint16_t)(UI_STEP_DBG_Y + 1u * UI_INFO_STEP), "PEAK",  (uint32_t)g_step_dyn_peak);
+	ui_kv_line((uint8_t)(UI_KV_STEP + 2u), (uint16_t)(UI_STEP_DBG_Y + 2u * UI_INFO_STEP), "REJ",   g_step_reject);
+	ui_kv_line((uint8_t)(UI_KV_STEP + 3u), (uint16_t)(UI_STEP_DBG_Y + 3u * UI_INFO_STEP), "SHOCK", g_step_shock);
+
+	/* 底下一行留给"再按一次清零"的提示。
+	 * 它平时是空的，但空着也得管 —— 提示消失时要把这行擦掉。 */
+	ui_confirm_hint();
 }
 
 /* RTC 时钟源那一行。为什么不用 ui_kv_line 直接显示数字：
@@ -940,10 +958,10 @@ static const char *ui_title_of(uint8_t page)
 {
 	switch (page)
 	{
-	case PAGE_STEP:  return "STEPS";
-	case PAGE_ACCEL: return "ACCEL";
-	case PAGE_INFO:  return "INFO";
-	default:         return "TIME";     /* PAGE_CLOCK */
+	case PAGE_STEP:  return "步数";
+	case PAGE_ACCEL: return "三轴";
+	case PAGE_INFO:  return "系统";
+	default:         return "时间";     /* PAGE_CLOCK */
 	}
 }
 
@@ -974,9 +992,11 @@ static void ui_card(uint16_t y, const char *label, uint8_t selected)
 	              (uint16_t)(UI_CARD_W - 2u * UI_CARD_BORDER),
 	              (uint16_t)(UI_CARD_H - 2u * UI_CARD_BORDER), LCD_BLACK);
 
-	w = lcd_str_width(label, 2u);
+	/* 用汉字宽度算 —— 菜单项都是中文，用 lcd_str_width 会按一个字节一个
+	 * 字符去数，宽度直接算错、字也排不到中间。 */
+	w = lcd_hz_str_width(label, 2u);
 	x = (uint16_t)(UI_CARD_X + (UI_CARD_W - w) / 2u);
-	lcd_draw_str(x, (uint16_t)(y + 8u), label, fg, LCD_BLACK, 2u);
+	lcd_draw_hz_str(x, (uint16_t)(y + 8u), label, fg, LCD_BLACK, 2u);
 }
 
 static void ui_menu_page(void)
@@ -987,7 +1007,7 @@ static void ui_menu_page(void)
 	if (s_page_valid == 0u)
 	{
 		/* 刚进菜单：标题 + 三张卡片全画 */
-		lcd_draw_str(UI_TITLE_X, UI_TITLE_Y, "MENU", LCD_CYAN, LCD_BLACK, 1u);
+		lcd_draw_hz_str(UI_TITLE_X, UI_TITLE_Y, "菜单", LCD_CYAN, LCD_BLACK, 1u);
 		lcd_fill_rect(0u, UI_RULE_Y, LCD_W, 1u, LCD_GREY);
 		for (i = 0u; i < (uint8_t)MENU_MAX; i++)
 		{
@@ -1014,15 +1034,77 @@ static void ui_menu_page(void)
 	s_menu_sel_shown = sel;
 }
 
-/* 细分页里按"确认"要做什么。目前只有步数页有实质动作（清零），
- * 别的页先留空 —— 等页面本身定下来再填。 */
+/* 二次确认超时检查，由 ui 任务每帧调用一次。
+ *
+ * 为什么必须做：不做的话提示会一直挂在屏幕上，而且隔了半小时再按一次确认
+ * 会被当成"第二下"，把步数清掉 —— 那两次按键在用户看来毫无关系。
+ * 另外这几个状态变量定义在 UI 实现区（比较靠后），所以这个检查也放在这里、
+ * 由 StartUiTask 调用，而不是在 StartUiTask 里直接访问它们。 */
+static void ui_confirm_tick(void)
+{
+	if ((s_confirm_pending != 0u) &&
+	    ((int32_t)(HAL_GetTick() - s_confirm_deadline) >= 0))
+	{
+		s_confirm_pending = 0u;
+		ui_invalidate();
+	}
+}
+
+/*
+ * 二次确认提示。
+ *
+ * ⚠ 注意"不显示"也是一种状态：提示消失时必须主动把这行擦掉。
+ *   本屏没有 framebuffer，不擦的话"再按确认清零"会一直留在屏幕上。
+ */
+static void ui_confirm_hint(void)
+{
+	static uint8_t shown = 0u;
+
+	if (s_confirm_pending != 0u)
+	{
+		lcd_fill_rect(0u, UI_HINT_Y, LCD_W, 16u, LCD_BLACK);
+		lcd_draw_hz_str(UI_TITLE_X, UI_HINT_Y, "再按确认清零", LCD_YELLOW, LCD_BLACK, 1u);
+		shown = 1u;
+	}
+	else if (shown != 0u)
+	{
+		lcd_fill_rect(0u, UI_HINT_Y, LCD_W, 16u, LCD_BLACK);
+		shown = 0u;
+	}
+	else
+	{
+		/* 一直是空的，什么都不用做 */
+	}
+}
+
+/*
+ * 细分页里按"确认"要做什么。
+ *
+ * ★ 步数清零做成了**二次确认**：第一次按只弹提示，3 秒内再按一次才真的清。
+ *   原来的实现是一按就清 —— 那是个危险的交互，用户想"确认"点什么，
+ *   手一抖就把累积的步数弄没了，而且找不回来。计数类数据不该这样。
+ */
 static void ui_detail_action(uint8_t menu_idx)
 {
-	if (menu_idx == (uint8_t)MENU_STEP)
+	if (menu_idx != (uint8_t)MENU_STEP)
 	{
-		step_reset();
-		g_step_dyn_peak = 0;         /* 连峰值一起清，否则调参时看着别扭 */
+		return;                      /* 其它页面暂时没有确认动作 */
 	}
+
+	if (s_confirm_pending == 0u)
+	{
+		/* 第一下：只记下"在等第二下"，不动任何数据 */
+		s_confirm_pending  = 1u;
+		s_confirm_deadline = HAL_GetTick() + UI_CONFIRM_MS;
+		ui_invalidate();             /* 强制重画，把提示显示出来 */
+		return;
+	}
+
+	/* 第二下：真的清 */
+	step_reset();
+	g_step_dyn_peak = 0;             /* 连峰值一起清，否则调参时看着别扭 */
+	s_confirm_pending = 0u;
+	ui_invalidate();
 }
 
 /*
@@ -1115,7 +1197,7 @@ static void ui_render(void)
 	{
 		/* 换页后的第一帧才需要画标题和分隔线。它们之后一直不变，
 		 * 每帧重画既浪费、又会让屏幕顶部跟着闪。 */
-		lcd_draw_str(UI_TITLE_X, UI_TITLE_Y, ui_title_of(page), LCD_CYAN, LCD_BLACK, 1u);
+		lcd_draw_hz_str(UI_TITLE_X, UI_TITLE_Y, ui_title_of(page), LCD_CYAN, LCD_BLACK, 1u);
 		lcd_fill_rect(0u, UI_RULE_Y, LCD_W, 1u, LCD_GREY);
 	}
 
