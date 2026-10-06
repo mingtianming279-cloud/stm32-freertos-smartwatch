@@ -32,6 +32,7 @@
 #include "lcd.h"
 #include "step.h"
 #include "rtc_time.h"
+#include "keys.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -97,6 +98,16 @@ typedef struct {
 #define UI_CLK_DATE_Y     130u
 #define UI_CLK_DATE_SCALE   2u      /* 2 倍 → 16x32；10 个字符 = 160 px 宽 */
 #define UI_CLK_WDAY_Y     184u
+
+/* ---- 菜单卡片 ---------------------------------------------------------
+ * 一个细分页面 = 一张卡片。三张竖排，选中的用青色边框 + 白字，
+ * 没选中的压暗。48 高 + 8 间隔，三张占 44~204，屏内。 */
+#define UI_CARD_X       20u
+#define UI_CARD_W      200u
+#define UI_CARD_H       48u
+#define UI_CARD_Y0      44u
+#define UI_CARD_STEP    56u
+#define UI_CARD_BORDER   2u
 
 #define UI_TEXT_DY     16u      /* 条内标签/数值的纵向偏移：条高 48、字高 16，正好居中 */
 
@@ -169,15 +180,40 @@ hb_mon_t g_mon[] = {
  * ------------------------------------------------------------------ */
 
  typedef enum {
-	 PAGE_HOME = 0,
-	 PAGE_STEP,
-	 PAGE_CLOCK,
-	 PAGE_INFO,
+	 PAGE_CLOCK = 0,     /* 时间 —— ★ 主页 */
+	 PAGE_STEP,          /* 步数 */
+	 PAGE_ACCEL,         /* 三轴柱状条（原来的 HOME） */
+	 PAGE_INFO,          /* 系统状态 */
 	 PAGE_MAX
  } page_id_t;
 
+ /* ── UI 三个状态 ────────────────────────────────────────────────────────
+  * 组长说过的那套导航：
+  *   主页(时间)  --任意键-->  菜单(卡片)  --左右选、中键进-->  细分页
+  *   细分页里三个键换语义：左=返回上一步、中=确认、右=回到主页
+  * ------------------------------------------------------------------- */
+ typedef enum {
+	 UI_MODE_MAIN = 0,   /* 主页：时间 */
+	 UI_MODE_MENU,       /* 菜单：卡片选择 */
+	 UI_MODE_DETAIL      /* 细分页 */
+ } ui_mode_t;
+
+ /* 菜单里能选哪几页。时间不在其中 —— 它本身就是主页。 */
+ typedef enum {
+	 MENU_STEP = 0,
+	 MENU_ACCEL,
+	 MENU_INFO,
+	 MENU_MAX
+ } menu_id_t;
+
+ static const uint8_t s_menu_pages[MENU_MAX] = { PAGE_STEP, PAGE_ACCEL, PAGE_INFO };
+ static const char *const s_menu_names[MENU_MAX] = { "STEPS", "ACCEL", "INFO" };
+
 volatile uint32_t g_ui_page    = 0;  /* 当前页面编号（镜像，供观测） */
-volatile uint32_t g_ui_page_sw = 0;  /* 累计翻页次数（用来对照按键数） */
+volatile uint32_t g_ui_page_sw = 0;  /* 累计切换次数 */
+volatile uint32_t g_ui_mode    = 0;  /* UI_MODE_MAIN / MENU / DETAIL */
+volatile uint32_t g_ui_menu_sel = 0; /* 菜单里选中的第几项 */
+volatile uint32_t g_ui_detail  = 0;  /* 细分页对应的菜单下标 */
 
 #define MON_COUNT (sizeof(g_mon) / sizeof(g_mon[0]))
 
@@ -247,12 +283,17 @@ const osMessageQueueAttr_t ui_q_attributes = {
 /* USER CODE BEGIN FunctionPrototypes */
 static void death_log_save(void);   /* 停喂前把"死因"写进备份寄存器 */
 static void ui_invalidate(void);
-static void ui_render(uint8_t page);
+static void ui_render(void);
+static void ui_handle_key(evt_t ev);
 static void ui_bar_update(uint8_t idx, uint16_t y, char label, int16_t v);
 static void ui_kv_line(uint8_t idx, uint16_t y, const char *label, uint32_t value);
 static void ui_step_page(void);
 static void ui_info_page(void);
 static void ui_clock_page(void);
+static void ui_accel_page(void);
+static void ui_menu_page(void);
+static const char *ui_title_of(uint8_t page);
+static void ui_page_body(uint8_t page);
 static void ui_two(char *p, uint8_t v);
 static void ui_rtc_line(uint16_t y);
 /* USER CODE END FunctionPrototypes */
@@ -416,29 +457,48 @@ void StartAlgoTask(void *argument)
 void StartKeyTask(void *argument)
 {
   /* USER CODE BEGIN StartKeyTask */
-	evt_t to_ui = EVT_KEY_PRESS;
 	/* Infinite loop */
 	for (;;) {
+		evt_t to_ui;
+		key_id_t k;
 
 		if (osSemaphoreAcquire(key_semHandle, osWaitForever) != osOK)
 			continue;
 		g_hb_key++;
 
+		/* 消抖：先等过抖动窗口，再回头确认那个键还按着 */
 		osDelay(KEY_SCAN_MS);
+
+		/* 把窗口期内到达的其它中断吃掉 —— 否则它们会在下一轮立刻
+		 * 触发一次"假按键" */
 		while (osSemaphoreAcquire(key_semHandle, 0) == osOK) {
 			g_key_bounce++;
 		}
 
-		if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_4) != GPIO_PIN_RESET) {
-			g_key_evt++;
-			if (osMessageQueuePut(ui_qHandle, &to_ui, 0u, 0u) == osOK) {
-				g_ui_put++;
-			} else {
-				g_ui_putfail++;
-			}
-
-		} else {
+		k = keys_take();
+		if (k == KEY_NONE) {
 			g_key_bounce++;
+			continue;
+		}
+
+		/* 抖完已经松开了 = 毛刺，丢掉 */
+		if (keys_level(k) == 0u) {
+			g_key_bounce++;
+			continue;
+		}
+
+		switch (k) {
+		case KEY_PREV: to_ui = EVT_KEY_PREV; break;
+		case KEY_NEXT: to_ui = EVT_KEY_NEXT; break;
+		case KEY_OK:   to_ui = EVT_KEY_OK;   break;
+		default:       continue;
+		}
+
+		g_key_evt++;
+		if (osMessageQueuePut(ui_qHandle, &to_ui, 0u, 0u) == osOK) {
+			g_ui_put++;
+		} else {
+			g_ui_putfail++;
 		}
 	}
   /* USER CODE END StartKeyTask */
@@ -455,7 +515,7 @@ void StartUiTask(void *argument)
 {
   /* USER CODE BEGIN StartUiTask */
 	evt_t rx = EVT_NONE;
-	uint8_t page_prev = 0xFFu;   /* 上一轮画的是哪一页；0xFF = 还没画过 */
+	uint8_t view_prev = 0xFFu;   /* 上一帧的界面标识（状态+页面）；0xFF = 还没画过 */
 
 	ui_invalidate();             /* 开机第一帧必须走完整绘制 */
 	/* Infinite loop */
@@ -465,10 +525,18 @@ void StartUiTask(void *argument)
 
 		if (st == osOK) {
 			switch (rx) {
-			case EVT_KEY_PRESS:
-				g_ui_page = (g_ui_page + 1) % PAGE_MAX;
-				g_ui_page_sw++;
+			/* 三个物理键。它们各自是什么意思，完全由 ui_handle_key
+			 * 按当前状态决定 —— 队列这一层只负责把"是哪个键"送上来 */
+			case EVT_KEY_PREV:
+			case EVT_KEY_NEXT:
+			case EVT_KEY_OK:
 				g_ui_evt++;
+				ui_handle_key(rx);
+				break;
+			/* 旧的笼统事件：当成"确认"处理，保留兼容 */
+			case EVT_KEY_PRESS:
+				g_ui_evt++;
+				ui_handle_key(EVT_KEY_OK);
 				break;
 			default:
 				g_evt_unknown++; /* 收到不认识的事件码，记一笔 */
@@ -476,20 +544,22 @@ void StartUiTask(void *argument)
 			}
 		}
 
-		/* 换页：上一页画过的东西不会自己消失（没有 framebuffer），只能清。
-		 * 这里只清内容区、不碰标题那一行以上，能省一点是一点。
-		 * 这一下是全屏扫描、肉眼看得见 —— 那是这套没有双缓冲的设计的固有
-		 * 代价，不打算靠"清得更快"去遮掩，只寄希望于 SPI 提速把它压短。 */
-		if (g_ui_page != page_prev) {
-			lcd_fill_rect(0u, UI_RULE_Y, LCD_W, (uint16_t)(LCD_H - UI_RULE_Y), LCD_BLACK);
-			page_prev = (uint8_t)g_ui_page;
-			ui_invalidate();
+		/* 界面标识 = 状态 + 页面。任何一项变了都要清一次内容区：
+		 * 本屏没有 framebuffer，上一屏画过的东西不会自己消失。
+		 * 只清内容区、不碰标题那一行以上，能省一点是一点。 */
+		{
+			uint8_t view = (uint8_t)(((uint8_t)g_ui_mode << 4) | (uint8_t)(g_ui_page & 0x0Fu));
+			if (view != view_prev) {
+				lcd_fill_rect(0u, UI_RULE_Y, LCD_W, (uint16_t)(LCD_H - UI_RULE_Y), LCD_BLACK);
+				view_prev = view;
+				ui_invalidate();
+			}
 		}
 
 		/* 屏幕走 SPI，不再碰 I2C，所以不需要 i2c_mutex 了。
 		 * 注意：以后如果有第二个任务也要画屏，得给 SPI 配一把锁 ——
 		 * 现在只有 ui 一个任务在写屏，所以先不加。 */
-		ui_render((uint8_t)g_ui_page);
+		ui_render();
 		g_ui_refresh++;   /* 这个计数器一直是预留，现在真的有人给它赋值了 */
 	}
   /* USER CODE END StartUiTask */
@@ -605,6 +675,7 @@ static bar_state_t s_bar[3];
 static uint32_t s_info_prev[UI_KV_LINES];     /* 键值行的上一次值（INFO 与 STEP 两页共用） */
 static uint32_t s_step_shown = 0xFFFFFFFFu;   /* 上次显示的步数；初值取一个不可能的值以强制首帧重画 */
 static uint32_t s_rtc_shown  = 0xFFFFFFFFu;   /* 上次显示的 RTC 时钟源 */
+static uint32_t s_menu_sel_shown = 0xFFFFFFFFu; /* 菜单上次高亮的是第几项 */
 static uint8_t s_page_valid = 0u;             /* 0 = 当前页的静态部分还没画 */
 
 static void ui_invalidate(void)
@@ -616,6 +687,7 @@ static void ui_invalidate(void)
 	s_page_valid = 0u;
 	s_step_shown = 0xFFFFFFFFu;
 	s_rtc_shown  = 0xFFFFFFFFu;
+	s_menu_sel_shown = 0xFFFFFFFFu;
 }
 
 static void ui_bar_update(uint8_t idx, uint16_t y, char label, int16_t v)
@@ -855,46 +927,210 @@ static void ui_clock_page(void)
 	             LCD_CYAN, LCD_BLACK, 1u);
 }
 
-static void ui_render(uint8_t page)
+/* 三条加速度柱状条。它原来是"主页"，现在降级成菜单里的一项 ——
+ * 本质上这是个调试视图，不该占着主页的位置。 */
+static void ui_accel_page(void)
 {
+	ui_bar_update(0u, (uint16_t)(UI_BAR_Y0 + 0u * UI_BAR_STEP), 'X', g_axf);
+	ui_bar_update(1u, (uint16_t)(UI_BAR_Y0 + 1u * UI_BAR_STEP), 'Y', g_ayf);
+	ui_bar_update(2u, (uint16_t)(UI_BAR_Y0 + 2u * UI_BAR_STEP), 'Z', g_azf);
+}
+
+static const char *ui_title_of(uint8_t page)
+{
+	switch (page)
+	{
+	case PAGE_STEP:  return "STEPS";
+	case PAGE_ACCEL: return "ACCEL";
+	case PAGE_INFO:  return "INFO";
+	default:         return "TIME";     /* PAGE_CLOCK */
+	}
+}
+
+/* 画具体页面的内容（标题由 ui_render 统一处理） */
+static void ui_page_body(uint8_t page)
+{
+	switch (page)
+	{
+	case PAGE_STEP:  ui_step_page();  break;
+	case PAGE_ACCEL: ui_accel_page(); break;
+	case PAGE_INFO:  ui_info_page();  break;
+	default:         ui_clock_page(); break;
+	}
+}
+
+/* 一张菜单卡片。选中的：青色边框 + 白字；没选中的：暗边框 + 灰字。
+ * 边框是靠"整块填边框色、再把内部挖成背景色"画出来的 —— 比画四条边省事，
+ * 而且圆角没有、方块感正好和这个字库搭。 */
+static void ui_card(uint16_t y, const char *label, uint8_t selected)
+{
+	uint16_t border = (selected != 0u) ? LCD_CYAN : LCD_DARK;
+	uint16_t fg     = (selected != 0u) ? LCD_WHITE : LCD_GREY;
+	uint16_t w, x;
+
+	lcd_fill_rect(UI_CARD_X, y, UI_CARD_W, UI_CARD_H, border);
+	lcd_fill_rect((uint16_t)(UI_CARD_X + UI_CARD_BORDER),
+	              (uint16_t)(y + UI_CARD_BORDER),
+	              (uint16_t)(UI_CARD_W - 2u * UI_CARD_BORDER),
+	              (uint16_t)(UI_CARD_H - 2u * UI_CARD_BORDER), LCD_BLACK);
+
+	w = lcd_str_width(label, 2u);
+	x = (uint16_t)(UI_CARD_X + (UI_CARD_W - w) / 2u);
+	lcd_draw_str(x, (uint16_t)(y + 8u), label, fg, LCD_BLACK, 2u);
+}
+
+static void ui_menu_page(void)
+{
+	uint8_t sel = (uint8_t)(g_ui_menu_sel % MENU_MAX);
+	uint8_t i;
+
+	if (s_page_valid == 0u)
+	{
+		/* 刚进菜单：标题 + 三张卡片全画 */
+		lcd_draw_str(UI_TITLE_X, UI_TITLE_Y, "MENU", LCD_CYAN, LCD_BLACK, 1u);
+		lcd_fill_rect(0u, UI_RULE_Y, LCD_W, 1u, LCD_GREY);
+		for (i = 0u; i < (uint8_t)MENU_MAX; i++)
+		{
+			ui_card((uint16_t)(UI_CARD_Y0 + i * UI_CARD_STEP),
+			        s_menu_names[i], (uint8_t)(i == sel));
+		}
+		s_menu_sel_shown = sel;
+		return;
+	}
+
+	if (s_menu_sel_shown == sel)
+	{
+		return;                      /* 选择没动，一个字都不用写 */
+	}
+
+	/* 只有"原来选中的"和"现在选中的"这两张要重画 ——
+	 * 每按一次就把三张全刷一遍是没必要的 */
+	if (s_menu_sel_shown < (uint32_t)MENU_MAX)
+	{
+		ui_card((uint16_t)(UI_CARD_Y0 + s_menu_sel_shown * UI_CARD_STEP),
+		        s_menu_names[s_menu_sel_shown], 0u);
+	}
+	ui_card((uint16_t)(UI_CARD_Y0 + sel * UI_CARD_STEP), s_menu_names[sel], 1u);
+	s_menu_sel_shown = sel;
+}
+
+/* 细分页里按"确认"要做什么。目前只有步数页有实质动作（清零），
+ * 别的页先留空 —— 等页面本身定下来再填。 */
+static void ui_detail_action(uint8_t menu_idx)
+{
+	if (menu_idx == (uint8_t)MENU_STEP)
+	{
+		step_reset();
+		g_step_dyn_peak = 0;         /* 连峰值一起清，否则调参时看着别扭 */
+	}
+}
+
+/*
+ * 一次按键 = 一次状态迁移。语义完全由**当前状态**决定：
+ *
+ *   主页   ：任意键      → 进菜单
+ *   菜单   ：左 / 右     → 上下选
+ *             中          → 进入选中的页面
+ *   细分页 ：左          → 返回上一步（回菜单）
+ *             中          → 确认（页面自己的动作）
+ *             右          → 回到主页
+ *
+ * 这就是你要的那套"三个键三种语义随页面切换"。物理键位始终是左-中-右，
+ * 用户不用记"现在这个键是什么" —— 位置对了就行。
+ */
+static void ui_handle_key(evt_t ev)
+{
+	switch (g_ui_mode)
+	{
+	case (uint32_t)UI_MODE_MAIN:
+		g_ui_mode     = (uint32_t)UI_MODE_MENU;
+		g_ui_menu_sel = 0u;
+		g_ui_page_sw++;
+		break;
+
+	case (uint32_t)UI_MODE_MENU:
+		if (ev == EVT_KEY_PREV)
+		{
+			g_ui_menu_sel = (g_ui_menu_sel + (uint32_t)MENU_MAX - 1u) % (uint32_t)MENU_MAX;
+		}
+		else if (ev == EVT_KEY_NEXT)
+		{
+			g_ui_menu_sel = (g_ui_menu_sel + 1u) % (uint32_t)MENU_MAX;
+		}
+		else if (ev == EVT_KEY_OK)
+		{
+			g_ui_detail = g_ui_menu_sel;
+			g_ui_mode   = (uint32_t)UI_MODE_DETAIL;
+			g_ui_page   = s_menu_pages[g_ui_detail % (uint32_t)MENU_MAX];
+		}
+		else { /* 不认识的键 */ }
+		g_ui_page_sw++;
+		break;
+
+	case (uint32_t)UI_MODE_DETAIL:
+		if (ev == EVT_KEY_PREV)              /* 返回上一步 */
+		{
+			g_ui_mode = (uint32_t)UI_MODE_MENU;
+		}
+		else if (ev == EVT_KEY_NEXT)         /* 回到主页 */
+		{
+			g_ui_mode = (uint32_t)UI_MODE_MAIN;
+			g_ui_page = (uint32_t)PAGE_CLOCK;
+		}
+		else if (ev == EVT_KEY_OK)           /* 确认 */
+		{
+			ui_detail_action((uint8_t)(g_ui_detail % (uint32_t)MENU_MAX));
+		}
+		else { /* 忽略 */ }
+		g_ui_page_sw++;
+		break;
+
+	default:
+		g_ui_mode = (uint32_t)UI_MODE_MAIN;  /* 状态坏了就回主页，别卡住 */
+		break;
+	}
+
+	/* 界面变了，差分记账必须全部作废 —— 否则新界面会拿着旧记录去比，
+	 * 该画的不画，屏幕上就是一片残缺。 */
+	ui_invalidate();
+}
+
+static void ui_render(void)
+{
+	uint8_t page;
+
+	/* 菜单是独立的一屏，标题也归它自己画 */
+	if (g_ui_mode == (uint32_t)UI_MODE_MENU)
+	{
+		ui_menu_page();
+		s_page_valid = 1u;
+		return;
+	}
+
+	page = (g_ui_mode == (uint32_t)UI_MODE_MAIN)
+	     ? (uint8_t)PAGE_CLOCK
+	     : (uint8_t)s_menu_pages[g_ui_detail % (uint32_t)MENU_MAX];
+
 	if (s_page_valid == 0u)
 	{
 		/* 换页后的第一帧才需要画标题和分隔线。它们之后一直不变，
 		 * 每帧重画既浪费、又会让屏幕顶部跟着闪。 */
-		const char *title = (page == (uint8_t)PAGE_HOME) ? "HOME"
-		                  : (page == (uint8_t)PAGE_STEP) ? "STEPS"
-		                  : (page == (uint8_t)PAGE_CLOCK) ? "CLOCK"
-		                  : "INFO";
-		lcd_draw_str(UI_TITLE_X, UI_TITLE_Y, title, LCD_CYAN, LCD_BLACK, 1u);
+		lcd_draw_str(UI_TITLE_X, UI_TITLE_Y, ui_title_of(page), LCD_CYAN, LCD_BLACK, 1u);
 		lcd_fill_rect(0u, UI_RULE_Y, LCD_W, 1u, LCD_GREY);
 	}
 
-	if (page == (uint8_t)PAGE_HOME)
-	{
-		ui_bar_update(0u, (uint16_t)(UI_BAR_Y0 + 0u * UI_BAR_STEP), 'X', g_axf);
-		ui_bar_update(1u, (uint16_t)(UI_BAR_Y0 + 1u * UI_BAR_STEP), 'Y', g_ayf);
-		ui_bar_update(2u, (uint16_t)(UI_BAR_Y0 + 2u * UI_BAR_STEP), 'Z', g_azf);
-	}
-	else if (page == (uint8_t)PAGE_STEP)
-	{
-		ui_step_page();
-	}
-	else if (page == (uint8_t)PAGE_CLOCK)
-	{
-		ui_clock_page();
-	}
-	else
-	{
-		ui_info_page();
-	}
-
+	ui_page_body(page);
 	s_page_valid = 1u;
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-	if (GPIO_Pin == key_Pin) {
+	/* 三个键走同一条路：先让 keys 模块记下"是哪个键"，再放一次信号量。
+	 * 消抖、判定、分发全都留给 key 任务 —— ISR 里只做最轻的两件事，
+	 * 和原来只有一颗键时的处理方式一致。 */
+	if ((GPIO_Pin == KEY_PREV_PIN) || (GPIO_Pin == KEY_NEXT_PIN) || (GPIO_Pin == KEY_OK_PIN)) {
+		keys_isr(GPIO_Pin);
 		g_key_irq++;
-		osSemaphoreRelease(key_semHandle); /* ISR 里只做这一件事 */
+		osSemaphoreRelease(key_semHandle);
 	}
 }
 /* USER CODE END Application */

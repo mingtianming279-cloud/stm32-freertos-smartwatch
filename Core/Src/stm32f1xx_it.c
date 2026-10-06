@@ -22,6 +22,7 @@
 #include "stm32f1xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "keys.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -188,5 +189,23 @@ void TIM1_UP_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
+
+/**
+  * @brief PB5 / PB6 共用的 EXTI 中断。
+  *
+  * F1 上 EXTI5~9 共用这一个向量，所以两个新增按键都落在这里。
+  *
+  * ⚠ 这个函数**必须写在 USER CODE 区**：.ioc 里没有给 PB5/PB6 配 EXTI，
+  *    生成区不会有它，而中断向量表里这个名字指向默认的弱定义 ——
+  *    不自己实现，两个按键按下去就永远没反应，而且不报任何错。
+  *
+  * 这里只做一件事：把引脚号交给 HAL，由它转进 HAL_GPIO_EXTI_Callback。
+  * 真正的消抖和分发都在 key 任务里。
+  */
+void EXTI9_5_IRQHandler(void)
+{
+  HAL_GPIO_EXTI_IRQHandler(KEY_PREV_PIN);
+  HAL_GPIO_EXTI_IRQHandler(KEY_NEXT_PIN);
+}
 
 /* USER CODE END 1 */
