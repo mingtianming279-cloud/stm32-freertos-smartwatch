@@ -23,8 +23,12 @@
 /* ---- 引脚（公开，因为 stm32f1xx_it.c 里要用）------------------------- */
 #define KEY_PREV_PORT   GPIOB
 #define KEY_PREV_PIN    GPIO_PIN_5      /* 上一个 */
-#define KEY_NEXT_PORT   GPIOB
-#define KEY_NEXT_PIN    GPIO_PIN_6      /* 下一个 */
+/* ★ 下一个键原本用 PB6，实机证实那个引脚不工作（板子局部硬件问题，
+ *   PB6/PB7 相邻、又都是 I2C1 的默认脚位）。
+ *   换到 PA8：完全空闲，而且落在 EXTI8 —— 仍属于 EXTI9_5 那个中断向量，
+ *   所以 stm32f1xx_it.c 里的处理函数一行都不用改。 */
+#define KEY_NEXT_PORT   GPIOA
+#define KEY_NEXT_PIN    GPIO_PIN_8      /* 下一个 */
 #define KEY_OK_PORT     GPIOA
 #define KEY_OK_PIN      GPIO_PIN_4      /* 确认（沿用原来那个按键） */
 

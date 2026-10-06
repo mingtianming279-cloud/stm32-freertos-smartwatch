@@ -29,16 +29,22 @@ void keys_init(void)
 {
 	GPIO_InitTypeDef gpio = {0};
 
+	__HAL_RCC_GPIOA_CLK_ENABLE();
 	__HAL_RCC_GPIOB_CLK_ENABLE();
 
-	/* PB5 / PB6：和 PA4 用同一套电平约定 —— 上升沿 + 内部下拉，
-	 * 也就是"按下接高电平"。 */
-	gpio.Pin   = KEY_PREV_PIN | KEY_NEXT_PIN;
-	gpio.Mode  = GPIO_MODE_IT_RISING;
-	gpio.Pull  = GPIO_PULLDOWN;
-	HAL_GPIO_Init(GPIOB, &gpio);
+	/* 和 PA4 用同一套电平约定：上升沿 + 内部下拉，也就是"按下接高电平"。
+	 * 两个键现在分属不同端口（PB5 / PA8），所以要分开初始化。 */
+	gpio.Mode = GPIO_MODE_IT_RISING;
+	gpio.Pull = GPIO_PULLDOWN;
 
-	/* PB5/PB6 共用 EXTI9_5；优先级和 EXTI4 保持一致。
+	gpio.Pin = KEY_PREV_PIN;
+	HAL_GPIO_Init(KEY_PREV_PORT, &gpio);
+
+	gpio.Pin = KEY_NEXT_PIN;
+	HAL_GPIO_Init(KEY_NEXT_PORT, &gpio);
+
+	/* PB5(EXTI5) 和 PA8(EXTI8) 都落在 EXTI9_5 这一个向量里；优先级和
+	 * EXTI4 保持一致。
 	 * ★ 必须低于 configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY，
 	 *   否则 ISR 里调 osSemaphoreRelease 会触发断言。 */
 	HAL_NVIC_SetPriority(EXTI9_5_IRQn, 5, 0);
