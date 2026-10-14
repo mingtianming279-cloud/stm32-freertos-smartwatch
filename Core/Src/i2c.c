@@ -63,6 +63,7 @@ volatile uint32_t g_i2c_scl_pd  = 0xFFFFFFFFu;
 volatile uint32_t g_i2c_sda_pd  = 0xFFFFFFFFu;
 volatile uint32_t g_i2c_rec_step = 0u;
 
+
 /* ── 总线取证探针（默认关闭）─────────────────────────────────────────────
  * 置 1 = 每次进恢复流程时，把外设从线上摘下来，分别用 MCU 内部上拉/下拉读
  *        一次两条线的电平，写进下面那组变量。当初就是靠它定位到"SCL 一路
@@ -118,7 +119,7 @@ volatile uint32_t g_i2c_rec_step = 0u;
 /* USER CODE END 0 */
 
 I2C_HandleTypeDef hi2c1;
-
+DMA_HandleTypeDef hdma_i2c1_rx;
 /* I2C1 init function */
 void MX_I2C1_Init(void)
 {
@@ -188,9 +189,30 @@ void HAL_I2C_MspInit(I2C_HandleTypeDef* i2cHandle)
 
     /* I2C1 clock enable */
     __HAL_RCC_I2C1_CLK_ENABLE();
-  /* USER CODE BEGIN I2C1_MspInit 1 */
 
-  /* USER CODE END I2C1_MspInit 1 */
+	  __HAL_RCC_DMA1_CLK_ENABLE();
+
+	  hdma_i2c1_rx.Instance = DMA1_Channel7;
+	  hdma_i2c1_rx.Init.Direction = DMA_PERIPH_TO_MEMORY;  /* 外设→内存 */
+	  hdma_i2c1_rx.Init.PeriphInc = DMA_PINC_DISABLE;
+	  hdma_i2c1_rx.Init.MemInc = DMA_MINC_ENABLE;
+	  hdma_i2c1_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
+	  hdma_i2c1_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
+	  hdma_i2c1_rx.Init.Mode = DMA_NORMAL;
+	  hdma_i2c1_rx.Init.Priority = DMA_PRIORITY_MEDIUM;
+	  HAL_DMA_Init(&hdma_i2c1_rx);
+
+	  __HAL_LINKDMA(i2cHandle, hdmarx, hdma_i2c1_rx);
+
+	  HAL_NVIC_SetPriority(DMA1_Channel7_IRQn, 1, 0);
+	  HAL_NVIC_EnableIRQ(DMA1_Channel7_IRQn);
+
+	  /* I2C1 事件/错误中断：DMA 搬完最后一个字节后，STOP 和完成回调
+	   * 都要靠事件中断收尾；错误中断不挂上，出错会掉进启动文件死循环。 */
+	  HAL_NVIC_SetPriority(I2C1_EV_IRQn, 0, 0);
+	  HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
+	  HAL_NVIC_SetPriority(I2C1_ER_IRQn, 0, 0);
+	  HAL_NVIC_EnableIRQ(I2C1_ER_IRQn);
   }
 }
 

@@ -208,4 +208,25 @@ void EXTI9_5_IRQHandler(void)
   HAL_GPIO_EXTI_IRQHandler(KEY_NEXT_PIN);
 }
 
+extern DMA_HandleTypeDef hdma_i2c1_rx;
+extern I2C_HandleTypeDef hi2c1;
+
+void DMA1_Channel7_IRQHandler(void)
+{
+  HAL_DMA_IRQHandler(&hdma_i2c1_rx);
+}
+
+/* I2C1 事件/错误中断：DMA 搬完最后一个字节后，STOP 条件和
+ * HAL_I2C_MemRxCpltCallback 都要靠事件中断收尾——没有它们，
+ * DMA 版永远不回调；错误中断不挂，出错会掉进启动文件的死循环。 */
+void I2C1_EV_IRQHandler(void)
+{
+  HAL_I2C_EV_IRQHandler(&hi2c1);
+}
+
+void I2C1_ER_IRQHandler(void)
+{
+  HAL_I2C_ER_IRQHandler(&hi2c1);
+}
+
 /* USER CODE END 1 */
